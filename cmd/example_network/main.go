@@ -1,4 +1,3 @@
-// Package main provides a complete example of using PVSS-BFT with a simulated network.
 package main
 
 import (
@@ -12,6 +11,7 @@ import (
 
 	log "log/slog"
 
+	"github.com/lrx0014/pvss-bft/pkg/crypto"
 	"github.com/lrx0014/pvss-bft/pkg/network"
 	"github.com/lrx0014/pvss-bft/pkg/protocol"
 	"github.com/lrx0014/pvss-bft/pkg/types"
@@ -98,6 +98,13 @@ func main() {
 
 	simNet := NewSimulatedNetwork(10 * time.Millisecond)
 
+	// Shared PVSS parameters for all nodes to ensure compatible shares
+	basePVSS, err := crypto.NewPVSS()
+	if err != nil {
+		log.Error("Failed to create shared PVSS parameters", "error", err)
+		return
+	}
+
 	nodes := make([]*protocol.Node, numNodes)
 	for i := 0; i < numNodes; i++ {
 		nodeID := types.NodeID(fmt.Sprintf("node-%d", i))
@@ -108,6 +115,7 @@ func main() {
 			NodeID:       nodeID,
 			Delta:        delta,
 			ViewDuration: 4 * delta,
+			PVSSParams:   basePVSS,
 		}
 
 		node, err := protocol.NewNode(config, net)

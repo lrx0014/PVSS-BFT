@@ -70,6 +70,7 @@ type ShareMessage struct {
 	View            View      `json:"view"`
 	LeaderID        NodeID    `json:"leader_id"`
 	LeaderShare     PVSSShare `json:"leader_share"`      // Share received from leader
+	DecryptedShare  *big.Int  `json:"decrypted_share"`   // Decrypted share S_i = H^p(i)
 	AwakeList       []NodeID  `json:"awake_list"`        // Nodes observed as awake
 	NextRoundCommit []NodeID  `json:"next_round_commit"` // Nodes committing to next round
 	Signature       []byte    `json:"signature"`

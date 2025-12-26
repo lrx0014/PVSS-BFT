@@ -1,4 +1,3 @@
-// Package protocol implements the PVSS-BFT consensus protocol.
 package protocol
 
 import (
@@ -36,6 +35,7 @@ type Config struct {
 	NodeID       types.NodeID
 	Delta        time.Duration // Network delay bound Δ
 	ViewDuration time.Duration // Total view duration (4Δ)
+	PVSSParams   *crypto.PVSS  // Shared PVSS parameters (p, q, g, h)
 }
 
 func DefaultConfig(nodeID types.NodeID) *Config {
@@ -115,9 +115,15 @@ func NewNode(config *Config, net NetworkInterface) (*Node, error) {
 		return nil, fmt.Errorf("failed to generate VRF key: %w", err)
 	}
 
-	pvss, err := crypto.NewPVSS()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create PVSS: %w", err)
+	var pvss *crypto.PVSS
+	if config.PVSSParams != nil {
+		// use shared parameters for compatibility across nodes
+		pvss = crypto.NewPVSSWithParams(config.PVSSParams.P, config.PVSSParams.Q, config.PVSSParams.G, config.PVSSParams.H)
+	} else {
+		pvss, err = crypto.NewPVSS()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create PVSS: %w", err)
+		}
 	}
 
 	pvssPriv, pvssPub, err := pvss.GenerateKeyPair()
@@ -274,6 +280,11 @@ func (n *Node) startView(view types.View) {
 		}
 	}
 
+	n.logger.Info("Start view",
+		"node_id", n.config.NodeID,
+		"view", view,
+		"active_nodes", len(n.consensus.ActiveNodes))
+
 	// Start Phase 1 timer
 	n.phaseTimer = time.AfterFunc(n.config.Delta, func() {
 		n.advancePhase(types.PhaseShare)
@@ -292,6 +303,11 @@ func (n *Node) advancePhase(phase types.Phase) {
 	}
 	n.consensus.Phase = phase
 	n.mu.Unlock()
+
+	n.logger.Info("Advance phase",
+		"node_id", n.config.NodeID,
+		"view", n.currentView,
+		"phase", phase)
 
 	switch phase {
 	case types.PhaseShare:
@@ -413,6 +429,11 @@ func (n *Node) executePhase1() {
 	sig, _ := n.signer.Sign(msgData)
 	proposeMsg.Signature = sig
 
+	n.logger.Info("Phase1 propose",
+		"node_id", nodeID,
+		"view", view,
+		"vrf", fmt.Sprintf("%x", vrfProof.Output))
+
 	n.mu.RLock()
 	broadcastCtx := n.ctx
 	n.mu.RUnlock()
@@ -500,6 +521,12 @@ func (n *Node) executePhase2() {
 		return
 	}
 
+	n.logger.Info("Phase2 leader elected",
+		"node_id", nodeID,
+		"view", view,
+		"leader", leaderID,
+		"leader_vrf", fmt.Sprintf("%x", maxVRF))
+
 	// Get share of the leader's PVSS
 	n.mu.RLock()
 	leaderProposal := n.consensus.Proposals[leaderID]
@@ -518,11 +545,37 @@ func (n *Node) executePhase2() {
 		}
 	}
 
+	// Verify if encrypted share matches leader commitment
+	participant := n.participants[nodeID]
+	if participant == nil {
+		n.logger.Warn("Missing participant info for share verification",
+			"node_id", nodeID,
+			"view", view)
+		return
+	}
+
+	if !n.pvss.Verify(ourShare.Index, participant.PVSSPubKey, ourShare.Value, leaderProposal.PVSS.Commitment.Coefficients) {
+		n.logger.Warn("Share verification failed, not broadcasting share message",
+			"node_id", nodeID,
+			"view", view)
+		return
+	}
+
+	// Decrypt the share for others to reconstruct
+	decrypted := n.pvss.DecryptShare(ourShare.Value, n.pvssPriv)
+	if decrypted == nil {
+		n.logger.Warn("Failed to decrypt share, not broadcasting share message",
+			"node_id", nodeID,
+			"view", view)
+		return
+	}
+
 	// Create share message
 	shareMsg := &types.ShareMessage{
 		View:            view,
 		LeaderID:        leaderID,
 		LeaderShare:     ourShare,
+		DecryptedShare:  decrypted,
 		AwakeList:       n.getAwakeList(),
 		NextRoundCommit: n.getNextRoundCommits(),
 	}
@@ -556,6 +609,12 @@ func (n *Node) executePhase3() {
 	leaderProposal := n.consensus.Proposals[leaderID]
 	view := n.currentView
 	nodeID := n.config.NodeID
+	activeCount := len(n.consensus.ActiveNodes)
+
+	if leaderProposal == nil {
+		n.mu.Unlock()
+		return
+	}
 
 	// Collect shares for reconstruction
 	shares := make([]*crypto.PVSSDecryptedShare, 0)
@@ -564,17 +623,32 @@ func (n *Node) executePhase3() {
 			continue
 		}
 
-		// Decrypt the share
-		if shareMsg.LeaderShare.Value == nil {
+		if shareMsg.LeaderShare.Value == nil || shareMsg.DecryptedShare == nil {
 			continue
 		}
 
-		// TODO: we would use proper PVSS decryption
-		// at this moment, we just simulate successful reconstruction
-		_ = senderID
+		// Ensure the share matches the sender identity
+		if shareMsg.LeaderShare.Recipient != senderID {
+			continue
+		}
+
+		// Verify encrypted share against leader commitment
+		senderInfo := n.participants[senderID]
+		if senderInfo == nil {
+			continue
+		}
+
+		if !n.pvss.Verify(shareMsg.LeaderShare.Index, senderInfo.PVSSPubKey, shareMsg.LeaderShare.Value, leaderProposal.PVSS.Commitment.Coefficients) {
+			n.logger.Warn("Share verification failed; dropping share",
+				"node_id", nodeID,
+				"view", view,
+				"from", senderID)
+			continue
+		}
+
 		shares = append(shares, &crypto.PVSSDecryptedShare{
 			Index: shareMsg.LeaderShare.Index,
-			Value: shareMsg.LeaderShare.Value,
+			Value: shareMsg.DecryptedShare,
 		})
 	}
 	n.mu.Unlock()
@@ -592,24 +666,30 @@ func (n *Node) executePhase3() {
 	var blockHash []byte
 
 	if leaderProposal != nil {
-		// Calculate required threshold
-		activeCount := len(n.consensus.ActiveNodes)
 		threshold := activeCount/2 + 1
 
 		if len(shares) >= threshold {
-			// Reconstruction would succeed
-			// Verify block hash matches
-			blockData, _ := json.Marshal(leaderProposal.Block)
-			preCommitData, _ := json.Marshal(leaderProposal.PreCommit)
-			expectedHash := crypto.HashMultiple(blockData, preCommitData)
-
-			if bytes.Equal(expectedHash, leaderProposal.PVSS.SecretHash) {
-				vote = true
+			// Attempt reconstruction of PVSS secret
+			reconstructed, err := n.pvss.Reconstruct(shares)
+			if err != nil {
+				n.logger.Warn("Failed to reconstruct PVSS secret",
+					"node_id", nodeID,
+					"view", view,
+					"error", err)
+			} else if n.pvss.VerifyReconstruction(reconstructed, leaderProposal.PVSS.SecretHash) {
+				// Verify block hash matches the secret hash
+				blockData, _ := json.Marshal(leaderProposal.Block)
 				blockHash = crypto.Hash(blockData)
+				vote = true
+				n.logger.Info("Phase3 vote true",
+					"node_id", nodeID,
+					"view", view,
+					"shares", len(shares),
+					"threshold", threshold)
 			} else {
-				// vote true if we have enough shares
-				vote = true
-				blockHash = crypto.Hash(blockData)
+				n.logger.Warn("Reconstructed PVSS secret mismatch; voting false",
+					"node_id", nodeID,
+					"view", view)
 			}
 		}
 	}
@@ -752,6 +832,30 @@ func (n *Node) handlePropose(msg *types.Message) {
 		}
 	}
 
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !verifySignatureForMessage(proposeMsg, participant.PublicKey, func(p *types.ProposeMessage) []byte {
+		sig := p.Signature
+		p.Signature = nil
+		return sig
+	}) {
+		return
+	}
+
+	// Verify VRF output
+	vrfInput := []byte(fmt.Sprintf("view:%d", proposeMsg.View))
+	vrfProof := &crypto.VRFProof{
+		Output: proposeMsg.VRF.Value,
+		Proof:  proposeMsg.VRF.Proof,
+	}
+	validVRF, _ := n.vrf.Verify(participant.VRFPubKey, vrfInput, vrfProof)
+	if !validVRF {
+		return
+	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -771,6 +875,19 @@ func (n *Node) handleShare(msg *types.Message) {
 		if err := json.Unmarshal(data, shareMsg); err != nil {
 			return
 		}
+	}
+
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !verifySignatureForMessage(shareMsg, participant.PublicKey, func(s *types.ShareMessage) []byte {
+		sig := s.Signature
+		s.Signature = nil
+		return sig
+	}) {
+		return
 	}
 
 	n.mu.Lock()
@@ -795,6 +912,19 @@ func (n *Node) handleVote(msg *types.Message) {
 		}
 	}
 
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !verifySignatureForMessage(voteMsg, participant.PublicKey, func(v *types.VoteMessage) []byte {
+		sig := v.Signature
+		v.Signature = nil
+		return sig
+	}) {
+		return
+	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -814,6 +944,19 @@ func (n *Node) handleConfirm(msg *types.Message) {
 		if err := json.Unmarshal(data, confirmMsg); err != nil {
 			return
 		}
+	}
+
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !verifySignatureForMessage(confirmMsg, participant.PublicKey, func(c *types.ConfirmMessage) []byte {
+		sig := c.Signature
+		c.Signature = nil
+		return sig
+	}) {
+		return
 	}
 
 	n.mu.Lock()
@@ -861,6 +1004,19 @@ func (n *Node) handleAwake(msg *types.Message) {
 		if err := json.Unmarshal(data, awakeMsg); err != nil {
 			return
 		}
+	}
+
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !verifySignatureForMessage(awakeMsg, participant.PublicKey, func(a *types.AwakeMessage) []byte {
+		sig := a.Signature
+		a.Signature = nil
+		return sig
+	}) {
+		return
 	}
 
 	n.mu.Lock()
@@ -988,6 +1144,21 @@ func (n *Node) broadcast(ctx context.Context, msgType types.MessageType, payload
 		Payload:   payload,
 	}
 	n.network.Broadcast(ctx, msg)
+}
+
+// verifySignatureForMessage clones msg, removes the signature field via clearSig, and verifies it.
+func verifySignatureForMessage[T any](msg *T, pub *ecdsa.PublicKey, clearSig func(*T) []byte) bool {
+	if msg == nil || pub == nil {
+		return false
+	}
+
+	msgCopy := *msg
+	sig := clearSig(&msgCopy)
+	data, err := json.Marshal(&msgCopy)
+	if err != nil {
+		return false
+	}
+	return crypto.Verify(pub, data, sig)
 }
 
 func (n *Node) getAwakeList() []types.NodeID {
