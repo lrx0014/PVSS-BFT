@@ -294,11 +294,122 @@ func (n *InMemoryNetwork) deliverMessage(msg *types.Message) {
 }
 
 func EncodeMessage(msg *types.Message) ([]byte, error) {
-	return json.Marshal(msg)
+	wrapper := struct {
+		Type      types.MessageType `json:"type"`
+		From      types.NodeID      `json:"from"`
+		Timestamp time.Time         `json:"timestamp"`
+		Payload   interface{}       `json:"payload"`
+	}{
+		Type:      msg.Type,
+		From:      msg.From,
+		Timestamp: msg.Timestamp,
+	}
+
+	switch msg.Type {
+	case types.MsgPropose:
+		switch p := msg.Payload.(type) {
+		case *types.ProposeMessage:
+			wrapper.Payload = p
+		case types.ProposeMessage:
+			wrapper.Payload = &p
+		default:
+			return nil, fmt.Errorf("invalid payload for MsgPropose: %T", msg.Payload)
+		}
+	case types.MsgShare:
+		switch p := msg.Payload.(type) {
+		case *types.ShareMessage:
+			wrapper.Payload = p
+		case types.ShareMessage:
+			wrapper.Payload = &p
+		default:
+			return nil, fmt.Errorf("invalid payload for MsgShare: %T", msg.Payload)
+		}
+	case types.MsgVote:
+		switch p := msg.Payload.(type) {
+		case *types.VoteMessage:
+			wrapper.Payload = p
+		case types.VoteMessage:
+			wrapper.Payload = &p
+		default:
+			return nil, fmt.Errorf("invalid payload for MsgVote: %T", msg.Payload)
+		}
+	case types.MsgConfirm:
+		switch p := msg.Payload.(type) {
+		case *types.ConfirmMessage:
+			wrapper.Payload = p
+		case types.ConfirmMessage:
+			wrapper.Payload = &p
+		default:
+			return nil, fmt.Errorf("invalid payload for MsgConfirm: %T", msg.Payload)
+		}
+	case types.MsgAwake:
+		switch p := msg.Payload.(type) {
+		case *types.AwakeMessage:
+			wrapper.Payload = p
+		case types.AwakeMessage:
+			wrapper.Payload = &p
+		default:
+			return nil, fmt.Errorf("invalid payload for MsgAwake: %T", msg.Payload)
+		}
+	default:
+		return nil, fmt.Errorf("unknown message type %d", msg.Type)
+	}
+
+	return json.Marshal(wrapper)
 }
 
 func DecodeMessage(data []byte) (*types.Message, error) {
-	var msg types.Message
-	err := json.Unmarshal(data, &msg)
-	return &msg, err
+	var header struct {
+		Type      types.MessageType `json:"type"`
+		From      types.NodeID      `json:"from"`
+		Timestamp time.Time         `json:"timestamp"`
+		Payload   json.RawMessage   `json:"payload"`
+	}
+
+	if err := json.Unmarshal(data, &header); err != nil {
+		return nil, err
+	}
+
+	msg := &types.Message{
+		Type:      header.Type,
+		From:      header.From,
+		Timestamp: header.Timestamp,
+	}
+
+	switch header.Type {
+	case types.MsgPropose:
+		var p types.ProposeMessage
+		if err := json.Unmarshal(header.Payload, &p); err != nil {
+			return nil, err
+		}
+		msg.Payload = &p
+	case types.MsgShare:
+		var p types.ShareMessage
+		if err := json.Unmarshal(header.Payload, &p); err != nil {
+			return nil, err
+		}
+		msg.Payload = &p
+	case types.MsgVote:
+		var p types.VoteMessage
+		if err := json.Unmarshal(header.Payload, &p); err != nil {
+			return nil, err
+		}
+		msg.Payload = &p
+	case types.MsgConfirm:
+		var p types.ConfirmMessage
+		if err := json.Unmarshal(header.Payload, &p); err != nil {
+			return nil, err
+		}
+		msg.Payload = &p
+	case types.MsgAwake:
+		var p types.AwakeMessage
+		if err := json.Unmarshal(header.Payload, &p); err != nil {
+			return nil, err
+		}
+		msg.Payload = &p
+	default:
+		return nil, fmt.Errorf("unknown message type %d", header.Type)
+	}
+
+	return msg, nil
 }
