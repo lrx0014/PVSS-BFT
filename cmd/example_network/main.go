@@ -19,32 +19,32 @@ import (
 
 // SimulatedNetwork creates a example network for demo purpose
 type SimulatedNetwork struct {
-	mu       sync.RWMutex
-	networks map[types.NodeID]*network.Network
-	delay    time.Duration
+	mu         sync.RWMutex
+	transports map[types.NodeID]*network.InMemoryNetwork
+	delay      time.Duration
 }
 
 func NewSimulatedNetwork(delay time.Duration) *SimulatedNetwork {
 	return &SimulatedNetwork{
-		networks: make(map[types.NodeID]*network.Network),
-		delay:    delay,
+		transports: make(map[types.NodeID]*network.InMemoryNetwork),
+		delay:      delay,
 	}
 }
 
-func (sn *SimulatedNetwork) AddNode(nodeID types.NodeID) *network.Network {
+func (sn *SimulatedNetwork) AddNode(nodeID types.NodeID) *network.InMemoryNetwork {
 	sn.mu.Lock()
 	defer sn.mu.Unlock()
 
-	net := network.NewNetwork(nodeID)
+	net := network.NewInMemoryNetwork(nodeID)
 	net.SetDelay(sn.delay)
 
 	// Connect to all existing nodes
-	for id, existingNet := range sn.networks {
-		net.AddPeer(id, "", existingNet)
-		existingNet.AddPeer(nodeID, "", net)
+	for id, existingNet := range sn.transports {
+		net.ConnectLocalPeer(id, "", existingNet)
+		existingNet.ConnectLocalPeer(nodeID, "", net)
 	}
 
-	sn.networks[nodeID] = net
+	sn.transports[nodeID] = net
 	return net
 }
 
@@ -53,21 +53,21 @@ func (sn *SimulatedNetwork) RemoveNode(nodeID types.NodeID) {
 	defer sn.mu.Unlock()
 
 	// remove from all network peers
-	for id, net := range sn.networks {
+	for id, net := range sn.transports {
 		if id != nodeID {
 			net.RemovePeer(nodeID)
 		}
 	}
 
-	delete(sn.networks, nodeID)
+	delete(sn.transports, nodeID)
 }
 
-func (sn *SimulatedNetwork) Start() {
+func (sn *SimulatedNetwork) Start(ctx context.Context) {
 	sn.mu.RLock()
 	defer sn.mu.RUnlock()
 
-	for _, net := range sn.networks {
-		net.Start()
+	for _, net := range sn.transports {
+		net.Start(ctx)
 	}
 }
 
@@ -75,7 +75,7 @@ func (sn *SimulatedNetwork) Stop() {
 	sn.mu.RLock()
 	defer sn.mu.RUnlock()
 
-	for _, net := range sn.networks {
+	for _, net := range sn.transports {
 		net.Stop()
 	}
 }
@@ -146,11 +146,11 @@ func main() {
 		}
 	}
 
-	simNet.Start()
-
 	// Create main context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	simNet.Start(ctx)
 
 	log.Info("Starting consensus protocol")
 	for _, node := range nodes {

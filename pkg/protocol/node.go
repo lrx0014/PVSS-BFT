@@ -17,17 +17,32 @@ import (
 
 // NetworkInterface defines the interface for network communication
 type NetworkInterface interface {
+	// LocalID returns the local node identifier for the transport.
+	LocalID() types.NodeID
+
 	// RegisterHandler registers a handler for a message type
 	RegisterHandler(msgType types.MessageType, handler func(msg *types.Message))
 
 	// Start starts the network
-	Start()
+	Start(ctx context.Context) error
 
 	// Stop stops the network
-	Stop()
+	Stop() error
+
+	// AddPeer registers a peer with an optional address
+	AddPeer(id types.NodeID, address string) error
+
+	// RemovePeer deregisters a peer.
+	RemovePeer(id types.NodeID)
+
+	// Send sends a message to a specific peer.
+	Send(ctx context.Context, to types.NodeID, msg *types.Message) error
 
 	// Broadcast sends a message to all peers.
 	Broadcast(ctx context.Context, msg *types.Message) error
+
+	// Peers returns the list of known peers.
+	Peers() []types.NodeID
 }
 
 // Config configuration for the PVSS-BFT node
@@ -189,7 +204,12 @@ func (n *Node) Start(ctx context.Context) error {
 	n.running = true
 	n.mu.Unlock()
 
-	n.network.Start()
+	if err := n.network.Start(n.ctx); err != nil {
+		n.mu.Lock()
+		n.running = false
+		n.mu.Unlock()
+		return err
+	}
 
 	n.startView(0)
 
@@ -218,7 +238,7 @@ func (n *Node) Stop() {
 	}
 	n.mu.Unlock()
 
-	n.network.Stop()
+	_ = n.network.Stop()
 }
 
 func (n *Node) AddParticipant(p *Participant) {
