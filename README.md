@@ -7,19 +7,25 @@ A Go implementation of the PVSS-BFT consensus protocol based on the paper "Effic
 ```
 pvss-bft/
 ├── cmd/
-│   └── examples/
-│       └── ......           # examples with simulated network and scenario
+│   └── examples/            # examples with simulated network and scenario
+│       └── ......
 ├── pkg/
-│   ├── crypto/
-│   │   ├── pvss.go          # implementation of PVSS
-│   │   ├── vrf.go           # implementation of VRF
-│   │   └── signatures.go    # signatures and hashing
-│   ├── network/
-│   │   └── network.go       # a network layer implementation
-│   ├── protocol/
-│   │   └── node.go          # implementation of the PVSS-BFT protocol
+│   ├── crypto/              # cryptographic algorithms
+│   │   ├── pvss.go
+│   │   ├── vrf.go
+│   │   └── signatures.go
+│   ├── network/             # network layer implementation
+│   │   ├── in_mem_network.go
+│   │   └── tcp_network.go
+│   ├── protocol/            # implementation of the PVSS-BFT protocol
+│   │   ├── handlers.go
+│   │   ├── interface.go
+│   │   ├── node_core.go
+│   │   ├── phases.go
+│   │   ├── sync.go
+│   │   └── utils.go
 │   └── types/
-│       └── types.go         # type definitions
+│       └── types.go         # data structures
 ├── go.mod
 └── README.md
 ```
