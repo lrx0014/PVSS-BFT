@@ -139,8 +139,6 @@ type NodeInfo struct {
 
 // ConsensusState tracks the state of consensus for a view
 type ConsensusState struct {
-	mu sync.RWMutex
-
 	View        View
 	Phase       Phase
 	ActiveNodes map[NodeID]bool
@@ -155,8 +153,7 @@ type ConsensusState struct {
 	AwakeLists    map[NodeID][]NodeID
 
 	// Phase 3 data
-	CollectedShares []PVSSShare
-	Votes           map[NodeID]*VoteMessage
+	Votes map[NodeID]*VoteMessage
 
 	// Phase 4 data
 	Confirms map[NodeID]*ConfirmMessage
@@ -178,7 +175,6 @@ func NewConsensusState(view View) *ConsensusState {
 		Proposals:        make(map[NodeID]*ProposeMessage),
 		ShareMessages:    make(map[NodeID]*ShareMessage),
 		AwakeLists:       make(map[NodeID][]NodeID),
-		CollectedShares:  make([]PVSSShare, 0),
 		Votes:            make(map[NodeID]*VoteMessage),
 		Confirms:         make(map[NodeID]*ConfirmMessage),
 		NextRoundCommits: make(map[NodeID]bool),

@@ -8,11 +8,17 @@ import (
 	"fmt"
 	log "log/slog"
 	"math/big"
+	"reflect"
 	"sync"
 	"time"
 
 	"github.com/lrx0014/pvss-bft/pkg/crypto"
 	"github.com/lrx0014/pvss-bft/pkg/types"
+)
+
+const (
+	DefaultViewMultiplier          = 4 // (4Δ)
+	DefaultMaxTransactionsPerBlock = 100
 )
 
 // NetworkInterface defines the interface for network communication
@@ -58,7 +64,7 @@ func DefaultConfig(nodeID types.NodeID) *Config {
 	return &Config{
 		NodeID:       nodeID,
 		Delta:        delta,
-		ViewDuration: 4 * delta,
+		ViewDuration: DefaultViewMultiplier * delta,
 	}
 }
 
@@ -300,11 +306,6 @@ func (n *Node) startView(view types.View) {
 		}
 	}
 
-	n.logger.Info("Start view",
-		"node_id", n.config.NodeID,
-		"view", view,
-		"active_nodes", len(n.consensus.ActiveNodes))
-
 	// Start Phase 1 timer
 	n.phaseTimer = time.AfterFunc(n.config.Delta, func() {
 		n.advancePhase(types.PhaseShare)
@@ -323,11 +324,6 @@ func (n *Node) advancePhase(phase types.Phase) {
 	}
 	n.consensus.Phase = phase
 	n.mu.Unlock()
-
-	n.logger.Info("Advance phase",
-		"node_id", n.config.NodeID,
-		"view", n.currentView,
-		"phase", phase)
 
 	switch phase {
 	case types.PhaseShare:
@@ -388,12 +384,8 @@ func (n *Node) executePhase1() {
 	nodeID := n.config.NodeID
 	n.mu.RUnlock()
 
-	if ctx != nil {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
+	if !n.checkContext(ctx) {
+		return
 	}
 
 	// create a block
@@ -414,10 +406,7 @@ func (n *Node) executePhase1() {
 	// create PVSS shares
 	pvssBundle, err := n.createPVSSBundle(combinedHash)
 	if err != nil {
-		n.logger.Error("Failed to create PVSS bundle",
-			"node_id", nodeID,
-			"view", view,
-			"error", err)
+		n.logError("Failed to create PVSS bundle", "error", err)
 		return
 	}
 
@@ -425,10 +414,7 @@ func (n *Node) executePhase1() {
 	vrfInput := []byte(fmt.Sprintf("view:%d", view))
 	vrfProof, err := n.vrf.Evaluate(n.vrfKey.PrivateKey, vrfInput)
 	if err != nil {
-		n.logger.Error("Failed to generate VRF",
-			"node_id", nodeID,
-			"view", view,
-			"error", err)
+		n.logError("Failed to generate VRF", "error", err)
 		return
 	}
 
@@ -449,10 +435,7 @@ func (n *Node) executePhase1() {
 	sig, _ := n.signer.Sign(msgData)
 	proposeMsg.Signature = sig
 
-	n.logger.Info("Phase1 propose",
-		"node_id", nodeID,
-		"view", view,
-		"vrf", fmt.Sprintf("%x", vrfProof.Output))
+	n.logInfo("Phase1: propose", "vrf", formatVRF(vrfProof.Output))
 
 	n.mu.RLock()
 	broadcastCtx := n.ctx
@@ -469,44 +452,400 @@ func (n *Node) executePhase1() {
 
 // executePhase2 executes Phase 2: Share Verification and Leader Election
 func (n *Node) executePhase2() {
-	n.mu.Lock()
-	if n.consensus == nil {
-		n.mu.Unlock()
+	n.mu.RLock()
+	ctx := n.ctx
+	view := n.currentView
+	nodeID := n.config.NodeID
+	n.mu.RUnlock()
+
+	if !n.checkContext(ctx) {
 		return
 	}
-	ctx := n.ctx
 
-	// verify proposals and elect leader
+	// Elect leader from valid proposals
+	leaderID, maxVRF := n.electLeader(view)
+	if leaderID == "" {
+		n.logWarn("No valid leader found")
+		return
+	}
+
+	n.logInfo("Phase2: leader elected", "leader", leaderID, "vrf", formatVRF(maxVRF))
+
+	// Verify and decrypt share from the leader
+	decryptedShare, ourShare := n.verifyAndDecryptLeaderShare(leaderID, view, nodeID)
+	if decryptedShare == nil {
+		return
+	}
+
+	// Broadcast decrypted share
+	n.broadcastShareMessage(view, leaderID, ourShare, decryptedShare, nodeID)
+}
+
+// executePhase3 executes Phase 3: Secret Reconstruction and Voting
+func (n *Node) executePhase3() {
+	n.mu.RLock()
+	ctx := n.ctx
+	view := n.currentView
+	nodeID := n.config.NodeID
+	n.mu.RUnlock()
+
+	if !n.checkContext(ctx) {
+		return
+	}
+
+	// Collect and verify shares from other nodes
+	shares := n.collectValidShares(view, nodeID)
+
+	// Determine vote based on secret reconstruction
+	vote, blockHash := n.determineVote(shares, view, nodeID)
+
+	// Broadcast vote message
+	n.broadcastVoteMessage(view, blockHash, vote, nodeID)
+}
+
+// executePhase4 executes Phase 4: Confirmation and Consensus
+func (n *Node) executePhase4() {
+	n.mu.RLock()
+	ctx := n.ctx
+	view := n.currentView
+	nodeID := n.config.NodeID
+	n.mu.RUnlock()
+
+	if !n.checkContext(ctx) {
+		return
+	}
+
+	// Count votes and determine if we should send confirmation
+	voteCount, decidedHash := n.countVotes()
+	if voteCount == 0 || decidedHash == nil {
+		return
+	}
+
+	// Broadcast confirmation if we have quorum of votes
+	n.broadcastConfirmIfQuorum(view, decidedHash, voteCount, nodeID)
+
+	// Check if we can decide on the block
+	consensus := n.requireConsensus(view)
+	if consensus != nil {
+		n.mu.Lock()
+		n.tryDecideBlock(consensus, decidedHash)
+		n.mu.Unlock()
+	}
+}
+
+// Message handlers
+
+func (n *Node) handlePropose(msg *types.Message) {
+	proposeMsg := n.unmarshalMessage(msg, &types.ProposeMessage{}).(*types.ProposeMessage)
+	if proposeMsg == nil {
+		return
+	}
+
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	// Verify signature
+	if !n.verifyMessageSignature(proposeMsg, participant.PublicKey) {
+		return
+	}
+
+	// Verify VRF output
+	if !n.verifyVRF(proposeMsg.View, proposeMsg.VRF, participant.VRFPubKey) {
+		return
+	}
+
+	// Store proposal
+	consensus := n.requireConsensus(proposeMsg.View)
+	if consensus == nil {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	consensus.Proposals[msg.From] = proposeMsg
+}
+
+func (n *Node) handleShare(msg *types.Message) {
+	shareMsg := n.unmarshalMessage(msg, &types.ShareMessage{}).(*types.ShareMessage)
+	if shareMsg == nil {
+		return
+	}
+
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !n.verifyMessageSignature(shareMsg, participant.PublicKey) {
+		return
+	}
+
+	consensus := n.requireConsensus(shareMsg.View)
+	if consensus == nil {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	consensus.ShareMessages[msg.From] = shareMsg
+	consensus.AwakeLists[msg.From] = shareMsg.AwakeList
+}
+
+func (n *Node) handleVote(msg *types.Message) {
+	voteMsg := n.unmarshalMessage(msg, &types.VoteMessage{}).(*types.VoteMessage)
+	if voteMsg == nil {
+		return
+	}
+
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !n.verifyMessageSignature(voteMsg, participant.PublicKey) {
+		return
+	}
+
+	consensus := n.requireConsensus(voteMsg.View)
+	if consensus == nil {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	consensus.Votes[msg.From] = voteMsg
+}
+
+func (n *Node) handleConfirm(msg *types.Message) {
+	confirmMsg := n.unmarshalMessage(msg, &types.ConfirmMessage{}).(*types.ConfirmMessage)
+	if confirmMsg == nil {
+		return
+	}
+
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !n.verifyMessageSignature(confirmMsg, participant.PublicKey) {
+		return
+	}
+
+	consensus := n.requireConsensus(confirmMsg.View)
+	if consensus == nil {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Store confirm
+	consensus.Confirms[msg.From] = confirmMsg
+
+	// Check if we can decide
+	n.tryDecideBlock(consensus, confirmMsg.BlockHash)
+}
+
+func (n *Node) handleAwake(msg *types.Message) {
+	awakeMsg := n.unmarshalMessage(msg, &types.AwakeMessage{}).(*types.AwakeMessage)
+	if awakeMsg == nil {
+		return
+	}
+
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !n.verifyMessageSignature(awakeMsg, participant.PublicKey) {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.consensus == nil {
+		return
+	}
+
+	// Mark node as newly awake
+	n.consensus.NewAwakeNodes[awakeMsg.NodeID] = true
+}
+
+// Helper methods
+
+// formatVRF formats VRF output in scientific notation for readability
+func formatVRF(vrfOutput []byte) string {
+	vrfInt := new(big.Int).SetBytes(vrfOutput)
+	// Convert to float64 for scientific notation
+	vrfFloat := new(big.Float).SetInt(vrfInt)
+	f64, _ := vrfFloat.Float64()
+	return fmt.Sprintf("%.3e", f64)
+}
+
+// logWithContext logs with common node context fields
+func (n *Node) logInfo(msg string, args ...interface{}) {
+	allArgs := []interface{}{"node", n.config.NodeID, "view", n.currentView}
+	allArgs = append(allArgs, args...)
+	n.logger.Info(msg, allArgs...)
+}
+
+func (n *Node) logWarn(msg string, args ...interface{}) {
+	allArgs := []interface{}{"node", n.config.NodeID, "view", n.currentView}
+	allArgs = append(allArgs, args...)
+	n.logger.Warn(msg, allArgs...)
+}
+
+func (n *Node) logError(msg string, args ...interface{}) {
+	allArgs := []interface{}{"node", n.config.NodeID, "view", n.currentView}
+	allArgs = append(allArgs, args...)
+	n.logger.Error(msg, allArgs...)
+}
+
+// checkContext returns false if the context is cancelled, true otherwise
+func (n *Node) checkContext(ctx context.Context) bool {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+	}
+	return true
+}
+
+// requireConsensus returns the consensus state if it exists and matches the view, nil otherwise
+func (n *Node) requireConsensus(view types.View) *types.ConsensusState {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.consensus == nil || n.consensus.View != view {
+		return nil
+	}
+	return n.consensus
+}
+
+func (n *Node) unmarshalMessage(msg *types.Message, target interface{}) interface{} {
+	// try direct type assertion first
+	targetType := reflect.TypeOf(target).Elem()
+	if reflect.TypeOf(msg.Payload) == reflect.PtrTo(targetType) {
+		return msg.Payload
+	}
+
+	// fallback to JSON unmarshaling
+	data, err := json.Marshal(msg.Payload)
+	if err != nil {
+		return nil
+	}
+
+	targetValue := reflect.New(targetType)
+	if err := json.Unmarshal(data, targetValue.Interface()); err != nil {
+		return nil
+	}
+
+	return targetValue.Interface()
+}
+
+func (n *Node) verifyMessageSignature(msg interface{}, publicKey *ecdsa.PublicKey) bool {
+	switch m := msg.(type) {
+	case *types.ProposeMessage:
+		return verifySignatureForMessage(m, publicKey, func(p *types.ProposeMessage) []byte {
+			sig := p.Signature
+			p.Signature = nil
+			return sig
+		})
+	case *types.ShareMessage:
+		return verifySignatureForMessage(m, publicKey, func(s *types.ShareMessage) []byte {
+			sig := s.Signature
+			s.Signature = nil
+			return sig
+		})
+	case *types.VoteMessage:
+		return verifySignatureForMessage(m, publicKey, func(v *types.VoteMessage) []byte {
+			sig := v.Signature
+			v.Signature = nil
+			return sig
+		})
+	case *types.ConfirmMessage:
+		return verifySignatureForMessage(m, publicKey, func(c *types.ConfirmMessage) []byte {
+			sig := c.Signature
+			c.Signature = nil
+			return sig
+		})
+	case *types.AwakeMessage:
+		return verifySignatureForMessage(m, publicKey, func(a *types.AwakeMessage) []byte {
+			sig := a.Signature
+			a.Signature = nil
+			return sig
+		})
+	}
+	return false
+}
+
+func (n *Node) verifyVRF(view types.View, vrf types.VRFOutput, publicKey *ecdsa.PublicKey) bool {
+	vrfInput := []byte(fmt.Sprintf("view:%d", view))
+	vrfProof := &crypto.VRFProof{
+		Output: vrf.Value,
+		Proof:  vrf.Proof,
+	}
+	valid, _ := n.vrf.Verify(publicKey, vrfInput, vrfProof)
+	return valid
+}
+
+// tryDecideBlock attempts to decide on a block if quorum is reached
+func (n *Node) tryDecideBlock(consensus *types.ConsensusState, decidedHash []byte) {
+	if consensus.DecidedBlock != nil {
+		return
+	}
+
+	confirmCount := 0
+	for _, cm := range consensus.Confirms {
+		if bytes.Equal(cm.BlockHash, decidedHash) {
+			confirmCount++
+		}
+	}
+
+	activeCount := len(consensus.ActiveNodes)
+	quorum := activeCount / 2
+
+	if confirmCount >= quorum {
+		leaderProposal := consensus.Proposals[consensus.LeaderID]
+		if leaderProposal != nil {
+			block := leaderProposal.Block
+			block.Hash = decidedHash
+			consensus.DecidedBlock = &block
+		}
+	}
+}
+
+// electLeader validates proposals and elects the leader based on highest VRF
+func (n *Node) electLeader(view types.View) (types.NodeID, []byte) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.consensus == nil {
+		return "", nil
+	}
+
 	var leaderID types.NodeID
 	var maxVRF []byte
 
-	validProposals := make(map[types.NodeID]*types.ProposeMessage)
-
 	for id, proposal := range n.consensus.Proposals {
-		// verify VRF
 		participant := n.participants[id]
 		if participant == nil {
 			continue
 		}
 
-		vrfInput := []byte(fmt.Sprintf("view:%d", n.currentView))
-		vrfProof := &crypto.VRFProof{
-			Output: proposal.VRF.Value,
-			Proof:  proposal.VRF.Proof,
-		}
-
-		valid, _ := n.vrf.Verify(participant.VRFPubKey, vrfInput, vrfProof)
-		if !valid {
+		// Verify VRF
+		if !n.verifyVRF(proposal.View, proposal.VRF, participant.VRFPubKey) {
 			continue
 		}
 
-		// TODO: verify PVSS shares (simplified - in production, verify each share)
-		// but for now, just check that shares exist
+		// Verify PVSS shares exist
 		if len(proposal.PVSS.Shares) == 0 {
 			continue
 		}
-
-		validProposals[id] = proposal
 
 		// Track highest VRF for leader election
 		if maxVRF == nil || crypto.CompareVRFOutputs(proposal.VRF.Value, maxVRF) > 0 {
@@ -522,41 +861,21 @@ func (n *Node) executePhase2() {
 
 	n.consensus.LeaderID = leaderID
 	n.consensus.LeaderVRF = maxVRF
-	nodeID := n.config.NodeID
-	view := n.currentView
-	n.mu.Unlock()
 
-	if ctx != nil {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-	}
+	return leaderID, maxVRF
+}
 
-	if leaderID == "" {
-		n.logger.Warn("No valid leader found",
-			"node_id", nodeID,
-			"view", view)
-		return
-	}
-
-	n.logger.Info("Phase2 leader elected",
-		"node_id", nodeID,
-		"view", view,
-		"leader", leaderID,
-		"leader_vrf", fmt.Sprintf("%x", maxVRF))
-
-	// Get share of the leader's PVSS
+// verifyAndDecryptLeaderShare verifies and decrypts our share from the leader
+func (n *Node) verifyAndDecryptLeaderShare(leaderID types.NodeID, view types.View, nodeID types.NodeID) (*big.Int, types.PVSSShare) {
 	n.mu.RLock()
 	leaderProposal := n.consensus.Proposals[leaderID]
 	n.mu.RUnlock()
 
 	if leaderProposal == nil {
-		return
+		return nil, types.PVSSShare{}
 	}
 
-	// Find share from leader
+	// Find our share from leader
 	var ourShare types.PVSSShare
 	for _, share := range leaderProposal.PVSS.Shares {
 		if share.Recipient == nodeID {
@@ -565,32 +884,31 @@ func (n *Node) executePhase2() {
 		}
 	}
 
-	// Verify if encrypted share matches leader commitment
+	// Get our participant info
 	participant := n.participants[nodeID]
 	if participant == nil {
-		n.logger.Warn("Missing participant info for share verification",
-			"node_id", nodeID,
-			"view", view)
-		return
+		n.logWarn("Missing participant info for share verification")
+		return nil, types.PVSSShare{}
 	}
 
+	// Verify encrypted share against leader's commitment
 	if !n.pvss.Verify(ourShare.Index, participant.PVSSPubKey, ourShare.Value, leaderProposal.PVSS.Commitment.Coefficients) {
-		n.logger.Warn("Share verification failed, not broadcasting share message",
-			"node_id", nodeID,
-			"view", view)
-		return
+		n.logWarn("Share verification failed")
+		return nil, types.PVSSShare{}
 	}
 
 	// Decrypt the share for others to reconstruct
 	decrypted := n.pvss.DecryptShare(ourShare.Value, n.pvssPriv)
 	if decrypted == nil {
-		n.logger.Warn("Failed to decrypt share, not broadcasting share message",
-			"node_id", nodeID,
-			"view", view)
-		return
+		n.logWarn("Failed to decrypt share")
+		return nil, types.PVSSShare{}
 	}
 
-	// Create share message
+	return decrypted, ourShare
+}
+
+// broadcastShareMessage creates and broadcasts a share message
+func (n *Node) broadcastShareMessage(view types.View, leaderID types.NodeID, ourShare types.PVSSShare, decrypted *big.Int, nodeID types.NodeID) {
 	shareMsg := &types.ShareMessage{
 		View:            view,
 		LeaderID:        leaderID,
@@ -607,6 +925,7 @@ func (n *Node) executePhase2() {
 	n.mu.RLock()
 	broadcastCtx := n.ctx
 	n.mu.RUnlock()
+
 	n.broadcast(broadcastCtx, types.MsgShare, shareMsg)
 
 	// Store share message
@@ -617,28 +936,29 @@ func (n *Node) executePhase2() {
 	n.mu.Unlock()
 }
 
-// executePhase3 executes Phase 3: Secret Reconstruction and Voting
-func (n *Node) executePhase3() {
-	n.mu.Lock()
+// collectValidShares collects and validates shares from other nodes
+func (n *Node) collectValidShares(view types.View, nodeID types.NodeID) []*crypto.PVSSDecryptedShare {
+	n.mu.RLock()
 	if n.consensus == nil {
-		n.mu.Unlock()
-		return
+		n.mu.RUnlock()
+		return nil
 	}
-	ctx := n.ctx
+
 	leaderID := n.consensus.LeaderID
 	leaderProposal := n.consensus.Proposals[leaderID]
-	view := n.currentView
-	nodeID := n.config.NodeID
-	activeCount := len(n.consensus.ActiveNodes)
-
 	if leaderProposal == nil {
-		n.mu.Unlock()
-		return
+		n.mu.RUnlock()
+		return nil
 	}
 
-	// Collect shares for reconstruction
+	shareMessages := make(map[types.NodeID]*types.ShareMessage)
+	for id, msg := range n.consensus.ShareMessages {
+		shareMessages[id] = msg
+	}
+	n.mu.RUnlock()
+
 	shares := make([]*crypto.PVSSDecryptedShare, 0)
-	for senderID, shareMsg := range n.consensus.ShareMessages {
+	for senderID, shareMsg := range shareMessages {
 		if shareMsg.LeaderID != leaderID {
 			continue
 		}
@@ -659,10 +979,7 @@ func (n *Node) executePhase3() {
 		}
 
 		if !n.pvss.Verify(shareMsg.LeaderShare.Index, senderInfo.PVSSPubKey, shareMsg.LeaderShare.Value, leaderProposal.PVSS.Commitment.Coefficients) {
-			n.logger.Warn("Share verification failed; dropping share",
-				"node_id", nodeID,
-				"view", view,
-				"from", senderID)
+			n.logWarn("Share verification failed, dropping share", "from", senderID)
 			continue
 		}
 
@@ -671,59 +988,62 @@ func (n *Node) executePhase3() {
 			Value: shareMsg.DecryptedShare,
 		})
 	}
-	n.mu.Unlock()
 
-	if ctx != nil {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
+	return shares
+}
+
+// determineVote reconstructs the secret and determines the vote
+func (n *Node) determineVote(shares []*crypto.PVSSDecryptedShare, view types.View, nodeID types.NodeID) (bool, []byte) {
+	n.mu.RLock()
+	if n.consensus == nil {
+		n.mu.RUnlock()
+		return false, nil
 	}
 
-	// Determine vote
-	vote := false
-	var blockHash []byte
+	leaderID := n.consensus.LeaderID
+	leaderProposal := n.consensus.Proposals[leaderID]
+	activeCount := len(n.consensus.ActiveNodes)
+	n.mu.RUnlock()
 
-	if leaderProposal != nil {
-		threshold := activeCount/2 + 1
-
-		if len(shares) >= threshold {
-			// Attempt reconstruction of PVSS secret
-			reconstructed, err := n.pvss.Reconstruct(shares)
-			if err != nil {
-				n.logger.Warn("Failed to reconstruct PVSS secret",
-					"node_id", nodeID,
-					"view", view,
-					"error", err)
-			} else if n.pvss.VerifyReconstruction(reconstructed, leaderProposal.PVSS.SecretHash) {
-				// Verify block hash matches the secret hash
-				blockData, _ := json.Marshal(leaderProposal.Block)
-				blockHash = crypto.Hash(blockData)
-				vote = true
-				n.logger.Info("Phase3 vote true",
-					"node_id", nodeID,
-					"view", view,
-					"shares", len(shares),
-					"threshold", threshold)
-			} else {
-				n.logger.Warn("Reconstructed PVSS secret mismatch; voting false",
-					"node_id", nodeID,
-					"view", view)
-			}
-		}
+	if leaderProposal == nil {
+		return false, nil
 	}
 
-	// TODO: Create vote PVSS
-	// (simplified with just hash of vote)
+	threshold := activeCount/2 + 1
+
+	if len(shares) < threshold {
+		return false, nil
+	}
+
+	// Attempt reconstruction of PVSS secret
+	reconstructed, err := n.pvss.Reconstruct(shares)
+	if err != nil {
+		n.logWarn("Failed to reconstruct PVSS secret", "error", err)
+		return false, nil
+	}
+
+	if !n.pvss.VerifyReconstruction(reconstructed, leaderProposal.PVSS.SecretHash) {
+		n.logWarn("PVSS secret mismatch, voting false")
+		return false, nil
+	}
+
+	// Verify block hash matches the secret hash
+	blockData, _ := json.Marshal(leaderProposal.Block)
+	blockHash := crypto.Hash(blockData)
+
+	n.logInfo("Phase3: vote", "vote", "yes", "for_leader", leaderID, "block_height", leaderProposal.Block.Height, "shares", len(shares), "threshold", threshold)
+
+	return true, blockHash
+}
+
+// broadcastVoteMessage creates and broadcasts a vote message
+func (n *Node) broadcastVoteMessage(view types.View, blockHash []byte, vote bool, nodeID types.NodeID) {
+	// Create vote PVSS
 	voteData := []byte(fmt.Sprintf("vote:%v:view:%d", vote, view))
 	voteHash := crypto.Hash(voteData)
 	votePVSS, err := n.createPVSSBundle(voteHash)
 	if err != nil {
-		n.logger.Error("Failed to create vote PVSS",
-			"node_id", nodeID,
-			"view", view,
-			"error", err)
+		n.logError("Failed to create vote PVSS", "error", err)
 		return
 	}
 
@@ -742,6 +1062,7 @@ func (n *Node) executePhase3() {
 	n.mu.RLock()
 	broadcastCtx := n.ctx
 	n.mu.RUnlock()
+
 	n.broadcast(broadcastCtx, types.MsgVote, voteMsg)
 
 	// Store vote
@@ -752,20 +1073,15 @@ func (n *Node) executePhase3() {
 	n.mu.Unlock()
 }
 
-// executePhase4 executes Phase 4: Confirmation and Consensus
-func (n *Node) executePhase4() {
-	n.mu.Lock()
-	if n.consensus == nil {
-		n.mu.Unlock()
-		return
-	}
-	ctx := n.ctx
-	view := n.currentView
-	nodeID := n.config.NodeID
-	leaderID := n.consensus.LeaderID
-	leaderProposal := n.consensus.Proposals[leaderID]
+// countVotes counts valid votes and returns the vote count and decided hash
+func (n *Node) countVotes() (int, []byte) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 
-	// Count valid votes
+	if n.consensus == nil {
+		return 0, nil
+	}
+
 	voteCount := 0
 	var decidedHash []byte
 
@@ -778,279 +1094,51 @@ func (n *Node) executePhase4() {
 		}
 	}
 
-	// Check if we have quorum
+	return voteCount, decidedHash
+}
+
+// broadcastConfirmIfQuorum broadcasts a confirmation message if vote quorum is reached
+func (n *Node) broadcastConfirmIfQuorum(view types.View, decidedHash []byte, voteCount int, nodeID types.NodeID) {
+	n.mu.RLock()
+	if n.consensus == nil {
+		n.mu.RUnlock()
+		return
+	}
+
+	leaderProposal := n.consensus.Proposals[n.consensus.LeaderID]
 	activeCount := len(n.consensus.ActiveNodes)
 	quorum := activeCount / 2
+	n.mu.RUnlock()
 
-	n.mu.Unlock()
-
-	if ctx != nil {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-	}
-
-	if voteCount >= quorum && leaderProposal != nil {
-		// confirm message
-		confirmMsg := &types.ConfirmMessage{
-			View:      view,
-			BlockHash: decidedHash,
-		}
-
-		msgData, _ := json.Marshal(confirmMsg)
-		sig, _ := n.signer.Sign(msgData)
-		confirmMsg.Signature = sig
-
-		n.mu.RLock()
-		broadcastCtx := n.ctx
-		n.mu.RUnlock()
-		n.broadcast(broadcastCtx, types.MsgConfirm, confirmMsg)
-
-		// Store confirm
-		n.mu.Lock()
-		if n.consensus != nil {
-			n.consensus.Confirms[nodeID] = confirmMsg
-		}
-		n.mu.Unlock()
-	}
-
-	// Check for decision (if we have enough confirms)
-	n.mu.Lock()
-	confirmCount := 0
-	for _, confirmMsg := range n.consensus.Confirms {
-		if bytes.Equal(confirmMsg.BlockHash, decidedHash) {
-			confirmCount++
-		}
-	}
-
-	if confirmCount >= quorum && leaderProposal != nil {
-		// Decide on the block
-		block := leaderProposal.Block
-		block.Hash = decidedHash
-		n.consensus.DecidedBlock = &block
-		n.logger.Info("Decided on block",
-			"node_id", nodeID,
-			"view", view,
-			"leader", leaderID,
-			"block_height", block.Height)
-	}
-	n.mu.Unlock()
-}
-
-// Message handlers
-
-func (n *Node) handlePropose(msg *types.Message) {
-	proposeMsg, ok := msg.Payload.(*types.ProposeMessage)
-	if !ok {
-		// try to unmarshal from msg
-		data, _ := json.Marshal(msg.Payload)
-		proposeMsg = &types.ProposeMessage{}
-		if err := json.Unmarshal(data, proposeMsg); err != nil {
-			return
-		}
-	}
-
-	participant := n.participants[msg.From]
-	if participant == nil {
+	if voteCount < quorum || leaderProposal == nil {
 		return
 	}
 
-	if !verifySignatureForMessage(proposeMsg, participant.PublicKey, func(p *types.ProposeMessage) []byte {
-		sig := p.Signature
-		p.Signature = nil
-		return sig
-	}) {
-		return
+	// Create confirmation message
+	confirmMsg := &types.ConfirmMessage{
+		View:      view,
+		BlockHash: decidedHash,
 	}
 
-	// Verify VRF output
-	vrfInput := []byte(fmt.Sprintf("view:%d", proposeMsg.View))
-	vrfProof := &crypto.VRFProof{
-		Output: proposeMsg.VRF.Value,
-		Proof:  proposeMsg.VRF.Proof,
-	}
-	validVRF, _ := n.vrf.Verify(participant.VRFPubKey, vrfInput, vrfProof)
-	if !validVRF {
-		return
-	}
+	msgData, _ := json.Marshal(confirmMsg)
+	sig, _ := n.signer.Sign(msgData)
+	confirmMsg.Signature = sig
 
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	n.logInfo("Phase4: confirm", "for_leader", leaderProposal.Block.Proposer, "block_height", leaderProposal.Block.Height, "votes", voteCount, "quorum", quorum)
 
-	if n.consensus == nil || proposeMsg.View != n.currentView {
-		return
-	}
+	n.mu.RLock()
+	broadcastCtx := n.ctx
+	n.mu.RUnlock()
 
-	// Store proposal
-	n.consensus.Proposals[msg.From] = proposeMsg
-}
-
-func (n *Node) handleShare(msg *types.Message) {
-	shareMsg, ok := msg.Payload.(*types.ShareMessage)
-	if !ok {
-		data, _ := json.Marshal(msg.Payload)
-		shareMsg = &types.ShareMessage{}
-		if err := json.Unmarshal(data, shareMsg); err != nil {
-			return
-		}
-	}
-
-	participant := n.participants[msg.From]
-	if participant == nil {
-		return
-	}
-
-	if !verifySignatureForMessage(shareMsg, participant.PublicKey, func(s *types.ShareMessage) []byte {
-		sig := s.Signature
-		s.Signature = nil
-		return sig
-	}) {
-		return
-	}
-
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if n.consensus == nil || shareMsg.View != n.currentView {
-		return
-	}
-
-	// Store share message
-	n.consensus.ShareMessages[msg.From] = shareMsg
-	n.consensus.AwakeLists[msg.From] = shareMsg.AwakeList
-}
-
-func (n *Node) handleVote(msg *types.Message) {
-	voteMsg, ok := msg.Payload.(*types.VoteMessage)
-	if !ok {
-		data, _ := json.Marshal(msg.Payload)
-		voteMsg = &types.VoteMessage{}
-		if err := json.Unmarshal(data, voteMsg); err != nil {
-			return
-		}
-	}
-
-	participant := n.participants[msg.From]
-	if participant == nil {
-		return
-	}
-
-	if !verifySignatureForMessage(voteMsg, participant.PublicKey, func(v *types.VoteMessage) []byte {
-		sig := v.Signature
-		v.Signature = nil
-		return sig
-	}) {
-		return
-	}
-
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if n.consensus == nil || voteMsg.View != n.currentView {
-		return
-	}
-
-	// Store vote
-	n.consensus.Votes[msg.From] = voteMsg
-}
-
-func (n *Node) handleConfirm(msg *types.Message) {
-	confirmMsg, ok := msg.Payload.(*types.ConfirmMessage)
-	if !ok {
-		data, _ := json.Marshal(msg.Payload)
-		confirmMsg = &types.ConfirmMessage{}
-		if err := json.Unmarshal(data, confirmMsg); err != nil {
-			return
-		}
-	}
-
-	participant := n.participants[msg.From]
-	if participant == nil {
-		return
-	}
-
-	if !verifySignatureForMessage(confirmMsg, participant.PublicKey, func(c *types.ConfirmMessage) []byte {
-		sig := c.Signature
-		c.Signature = nil
-		return sig
-	}) {
-		return
-	}
-
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if n.consensus == nil || confirmMsg.View != n.currentView {
-		return
-	}
+	n.broadcast(broadcastCtx, types.MsgConfirm, confirmMsg)
 
 	// Store confirm
-	n.consensus.Confirms[msg.From] = confirmMsg
-
-	// Check if we can decide
-	decidedHash := confirmMsg.BlockHash
-	confirmCount := 0
-	for _, cm := range n.consensus.Confirms {
-		if bytes.Equal(cm.BlockHash, decidedHash) {
-			confirmCount++
-		}
-	}
-
-	activeCount := len(n.consensus.ActiveNodes)
-	quorum := activeCount / 2
-
-	if confirmCount >= quorum && n.consensus.DecidedBlock == nil {
-		leaderProposal := n.consensus.Proposals[n.consensus.LeaderID]
-		if leaderProposal != nil {
-			block := leaderProposal.Block
-			block.Hash = decidedHash
-			n.consensus.DecidedBlock = &block
-			n.logger.Info("Decided on block",
-				"node_id", n.config.NodeID,
-				"view", confirmMsg.View,
-				"leader", n.consensus.LeaderID,
-				"block_height", block.Height)
-		}
-	}
-}
-
-func (n *Node) handleAwake(msg *types.Message) {
-	awakeMsg, ok := msg.Payload.(*types.AwakeMessage)
-	if !ok {
-		data, _ := json.Marshal(msg.Payload)
-		awakeMsg = &types.AwakeMessage{}
-		if err := json.Unmarshal(data, awakeMsg); err != nil {
-			return
-		}
-	}
-
-	participant := n.participants[msg.From]
-	if participant == nil {
-		return
-	}
-
-	if !verifySignatureForMessage(awakeMsg, participant.PublicKey, func(a *types.AwakeMessage) []byte {
-		sig := a.Signature
-		a.Signature = nil
-		return sig
-	}) {
-		return
-	}
-
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if n.consensus == nil {
-		return
+	if n.consensus != nil {
+		n.consensus.Confirms[nodeID] = confirmMsg
 	}
-
-	// Mark node as newly awake
-	n.consensus.NewAwakeNodes[awakeMsg.NodeID] = true
+	n.mu.Unlock()
 }
-
-// Helper methods
 
 func (n *Node) createBlock(view types.View) *types.Block {
 	n.mu.Lock()
@@ -1059,10 +1147,9 @@ func (n *Node) createBlock(view types.View) *types.Block {
 	// Get transactions from pool
 	txs := make([]types.Transaction, 0)
 	if len(n.txPool) > 0 {
-		// only take up to 100 transactions for performance reasons
 		count := len(n.txPool)
-		if count > 100 {
-			count = 100
+		if count > DefaultMaxTransactionsPerBlock {
+			count = DefaultMaxTransactionsPerBlock
 		}
 		txs = n.txPool[:count]
 		n.txPool = n.txPool[count:]
