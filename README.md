@@ -7,8 +7,8 @@ A Go implementation of the PVSS-BFT consensus protocol based on the paper "Effic
 ```
 pvss-bft/
 ├── cmd/
-│   └── example_network/
-│       └── main.go          # an easy example with a simulated network
+│   └── examples/
+│       └── ......           # examples with simulated network and scenario
 ├── pkg/
 │   ├── crypto/
 │   │   ├── pvss.go          # implementation of PVSS
@@ -35,8 +35,11 @@ cd pvss-bft
 # dependencies
 go mod download
 
-# run example
-go run ./cmd/example_network/main.go
+# run example (in-memory simulation)
+go run ./cmd/examples/local_network
+
+# run example (tcp network)
+go run ./cmd/examples/tcp_network
 ```
 
 ## References
