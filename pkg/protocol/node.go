@@ -193,6 +193,8 @@ func (n *Node) registerHandlers() {
 	n.network.RegisterHandler(types.MsgVote, func(msg *types.Message) { n.handleVote(msg) })
 	n.network.RegisterHandler(types.MsgConfirm, func(msg *types.Message) { n.handleConfirm(msg) })
 	n.network.RegisterHandler(types.MsgAwake, func(msg *types.Message) { n.handleAwake(msg) })
+	n.network.RegisterHandler(types.MsgSyncRequest, func(msg *types.Message) { n.handleSyncRequest(msg) })
+	n.network.RegisterHandler(types.MsgSyncResponse, func(msg *types.Message) { n.handleSyncResponse(msg) })
 }
 
 func (n *Node) Start(ctx context.Context) error {
@@ -279,6 +281,29 @@ func (n *Node) SetLogger(logger *log.Logger) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.logger = logger
+}
+
+// Sleep puts the node into sleep mode, stops participating in consensus
+func (n *Node) Sleep() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.state = types.StateSleepy
+}
+
+// Wake wakes the node from sleep mode
+func (n *Node) Wake() {
+	n.mu.Lock()
+	n.state = types.StateAwake
+	n.mu.Unlock()
+
+	// After waking, synchronize with peers to catch up on missed blocks
+	go n.synchronizeWithPeers()
+}
+
+func (n *Node) GetState() types.NodeState {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.state
 }
 
 func (n *Node) GetPublicInfo() *Participant {
@@ -453,6 +478,10 @@ func (n *Node) executePhase1() {
 // executePhase2 executes Phase 2: Share Verification and Leader Election
 func (n *Node) executePhase2() {
 	n.mu.RLock()
+	if n.state != types.StateAwake {
+		n.mu.RUnlock()
+		return
+	}
 	ctx := n.ctx
 	view := n.currentView
 	nodeID := n.config.NodeID
@@ -484,6 +513,10 @@ func (n *Node) executePhase2() {
 // executePhase3 executes Phase 3: Secret Reconstruction and Voting
 func (n *Node) executePhase3() {
 	n.mu.RLock()
+	if n.state != types.StateAwake {
+		n.mu.RUnlock()
+		return
+	}
 	ctx := n.ctx
 	view := n.currentView
 	nodeID := n.config.NodeID
@@ -506,6 +539,10 @@ func (n *Node) executePhase3() {
 // executePhase4 executes Phase 4: Confirmation and Consensus
 func (n *Node) executePhase4() {
 	n.mu.RLock()
+	if n.state != types.StateAwake {
+		n.mu.RUnlock()
+		return
+	}
 	ctx := n.ctx
 	view := n.currentView
 	nodeID := n.config.NodeID
@@ -674,6 +711,165 @@ func (n *Node) handleAwake(msg *types.Message) {
 	n.consensus.NewAwakeNodes[awakeMsg.NodeID] = true
 }
 
+func (n *Node) handleSyncRequest(msg *types.Message) {
+	syncReq := n.unmarshalMessage(msg, &types.SyncRequestMessage{}).(*types.SyncRequestMessage)
+	if syncReq == nil {
+		return
+	}
+
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !n.verifyMessageSignature(syncReq, participant.PublicKey) {
+		return
+	}
+
+	n.logInfo("Received sync request", "from", msg.From, "from_height", syncReq.FromHeight, "to_height", syncReq.ToHeight)
+
+	// Get requested blocks
+	blocks := n.chain.GetBlockRange(syncReq.FromHeight+1, syncReq.ToHeight)
+	if blocks == nil {
+		n.logWarn("Cannot provide blocks for sync", "from", msg.From, "from_height", syncReq.FromHeight, "to_height", syncReq.ToHeight)
+		return
+	}
+
+	// Send sync response
+	syncResp := &types.SyncResponseMessage{
+		NodeID: n.config.NodeID,
+		Blocks: blocks,
+	}
+
+	msgData, _ := json.Marshal(syncResp)
+	sig, _ := n.signer.Sign(msgData)
+	syncResp.Signature = sig
+
+	n.mu.RLock()
+	ctx := n.ctx
+	n.mu.RUnlock()
+
+	n.logInfo("Sending sync response", "to", msg.From, "blocks_count", len(blocks))
+	_ = n.network.Send(ctx, msg.From, &types.Message{
+		Type:      types.MsgSyncResponse,
+		From:      n.config.NodeID,
+		Timestamp: time.Now(),
+		Payload:   syncResp,
+	})
+}
+
+func (n *Node) handleSyncResponse(msg *types.Message) {
+	syncResp := n.unmarshalMessage(msg, &types.SyncResponseMessage{}).(*types.SyncResponseMessage)
+	if syncResp == nil {
+		return
+	}
+
+	participant := n.participants[msg.From]
+	if participant == nil {
+		return
+	}
+
+	if !n.verifyMessageSignature(syncResp, participant.PublicKey) {
+		return
+	}
+
+	n.logInfo("Received sync response", "from", msg.From, "blocks_count", len(syncResp.Blocks))
+
+	// Apply blocks to self chain
+	for _, block := range syncResp.Blocks {
+		// Validate block height is sequential
+		expectedHeight := n.chain.Height() + 1
+		if block.Height != expectedHeight {
+			n.logWarn("Received out-of-order block", "expected", expectedHeight, "got", block.Height)
+			continue
+		}
+
+		// Add block to chain
+		n.chain.Append(block)
+		n.logInfo("Synced block", "height", block.Height, "proposer", block.Proposer, "view", block.View)
+
+		// Trigger callback if set
+		n.mu.RLock()
+		callback := n.onBlockDecided
+		n.mu.RUnlock()
+
+		if callback != nil {
+			callback(block)
+		}
+	}
+
+	n.logInfo("Sync completed", "new_height", n.chain.Height())
+}
+
+// synchronizeWithPeers requests missing blocks from peers when waking up
+func (n *Node) synchronizeWithPeers() {
+	n.mu.RLock()
+	myHeight := n.chain.Height()
+	ctx := n.ctx
+	currentView := n.currentView
+	nodeID := n.config.NodeID
+	n.mu.RUnlock()
+
+	if !n.checkContext(ctx) {
+		return
+	}
+
+	// Ask peers about their chain height
+	peers := n.network.Peers()
+	if len(peers) == 0 {
+		n.logWarn("No peers available for synchronization")
+		return
+	}
+
+	// Request up to 1000 blocks ahead per round
+	maxRequestHeight := 1000
+
+	n.logInfo("Starting synchronization", "my_height", myHeight, "current_view", currentView, "requesting_up_to", maxRequestHeight)
+
+	// Request blocks from the first available peer
+	for _, peerID := range peers {
+		if peerID == nodeID {
+			continue
+		}
+
+		syncReq := &types.SyncRequestMessage{
+			NodeID:      nodeID,
+			FromHeight:  myHeight,
+			ToHeight:    uint64(maxRequestHeight),
+			CurrentView: currentView,
+		}
+
+		msgData, _ := json.Marshal(syncReq)
+		sig, _ := n.signer.Sign(msgData)
+		syncReq.Signature = sig
+
+		n.logInfo("Requesting sync from peer", "peer", peerID, "from_height", myHeight+1, "max_requested_height", maxRequestHeight)
+
+		err := n.network.Send(ctx, peerID, &types.Message{
+			Type:      types.MsgSyncRequest,
+			From:      nodeID,
+			Timestamp: time.Now(),
+			Payload:   syncReq,
+		})
+
+		if err == nil {
+			// wait a bit for the response to be processed
+			time.Sleep(500 * time.Millisecond)
+			break
+		}
+	}
+
+	n.mu.RLock()
+	newHeight := n.chain.Height()
+	n.mu.RUnlock()
+
+	if newHeight > myHeight {
+		n.logInfo("Synchronization successful", "old_height", myHeight, "new_height", newHeight, "blocks_synced", newHeight-myHeight)
+	} else {
+		n.logInfo("No blocks to sync or sync pending")
+	}
+}
+
 // Helper methods
 
 // formatVRF formats VRF output in scientific notation for readability
@@ -777,6 +973,18 @@ func (n *Node) verifyMessageSignature(msg interface{}, publicKey *ecdsa.PublicKe
 		return verifySignatureForMessage(m, publicKey, func(a *types.AwakeMessage) []byte {
 			sig := a.Signature
 			a.Signature = nil
+			return sig
+		})
+	case *types.SyncRequestMessage:
+		return verifySignatureForMessage(m, publicKey, func(s *types.SyncRequestMessage) []byte {
+			sig := s.Signature
+			s.Signature = nil
+			return sig
+		})
+	case *types.SyncResponseMessage:
+		return verifySignatureForMessage(m, publicKey, func(s *types.SyncResponseMessage) []byte {
+			sig := s.Signature
+			s.Signature = nil
 			return sig
 		})
 	}

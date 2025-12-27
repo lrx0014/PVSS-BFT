@@ -97,6 +97,20 @@ type AwakeMessage struct {
 	Signature []byte    `json:"signature"`
 }
 
+type SyncRequestMessage struct {
+	NodeID      NodeID `json:"node_id"`
+	FromHeight  uint64 `json:"from_height"` // Height of last block we have
+	ToHeight    uint64 `json:"to_height"`   // Height we want to sync to
+	CurrentView View   `json:"current_view"`
+	Signature   []byte `json:"signature"`
+}
+
+type SyncResponseMessage struct {
+	NodeID    NodeID   `json:"node_id"`
+	Blocks    []*Block `json:"blocks"` // Missing blocks to sync
+	Signature []byte   `json:"signature"`
+}
+
 type MessageType int
 
 const (
@@ -105,6 +119,8 @@ const (
 	MsgVote
 	MsgConfirm
 	MsgAwake
+	MsgSyncRequest
+	MsgSyncResponse
 )
 
 type Message struct {
@@ -222,4 +238,34 @@ func (c *Chain) Height() uint64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return uint64(len(c.Blocks) - 1)
+}
+
+func (c *Chain) GetBlock(height uint64) *Block {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if height >= uint64(len(c.Blocks)) {
+		return nil
+	}
+	return c.Blocks[height]
+}
+
+func (c *Chain) GetBlockRange(fromHeight, toHeight uint64) []*Block {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if fromHeight >= uint64(len(c.Blocks)) {
+		return nil
+	}
+
+	if toHeight >= uint64(len(c.Blocks)) {
+		toHeight = uint64(len(c.Blocks) - 1)
+	}
+
+	if fromHeight > toHeight {
+		return nil
+	}
+
+	blocks := make([]*Block, toHeight-fromHeight+1)
+	copy(blocks, c.Blocks[fromHeight:toHeight+1])
+	return blocks
 }
