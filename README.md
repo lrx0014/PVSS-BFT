@@ -38,6 +38,9 @@ go mod download
 # run example (in-memory simulation)
 go run ./cmd/examples/local_network
 
+# run example (sleep/awake simulation)
+go run ./cmd/examples/sleepy_demo
+
 # run example (tcp network)
 go run ./cmd/examples/tcp_network
 ```
